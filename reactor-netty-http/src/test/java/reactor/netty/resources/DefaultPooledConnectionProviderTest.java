@@ -15,6 +15,10 @@
  */
 package reactor.netty.resources;
 
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Metrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
@@ -28,7 +32,9 @@ import io.netty.handler.ssl.SslProvider;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
 import org.apache.commons.lang3.StringUtils;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -38,7 +44,6 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Signal;
 import reactor.netty.BaseHttpTest;
-import reactor.netty.ByteBufMono;
 import reactor.netty.ConnectionObserver;
 import reactor.netty.http.Http11SslContextSpec;
 import reactor.netty.http.Http2SslContextSpec;
@@ -62,16 +67,39 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static reactor.netty.Metrics.ACTIVE_CONNECTIONS;
+import static reactor.netty.Metrics.CONNECTION_PROVIDER_PREFIX;
+import static reactor.netty.Metrics.IDLE_CONNECTIONS;
+import static reactor.netty.Metrics.NAME;
+import static reactor.netty.Metrics.REMOTE_ADDRESS;
+import static reactor.netty.Metrics.TOTAL_CONNECTIONS;
+import static reactor.netty.http.client.HttpClientState.STREAM_CONFIGURED;
 
 class DefaultPooledConnectionProviderTest extends BaseHttpTest {
 
 	static SelfSignedCertificate ssc;
 
+	private MeterRegistry registry;
+
 	@BeforeAll
 	static void createSelfSignedCertificate() throws CertificateException {
 		ssc = new SelfSignedCertificate();
+	}
+
+	@BeforeEach
+	void setUp() {
+		registry = new SimpleMeterRegistry();
+		Metrics.addRegistry(registry);
+	}
+
+	@AfterEach
+	void tearDown() {
+		Metrics.removeRegistry(registry);
+		registry.clear();
+		registry.close();
 	}
 
 	@Test
@@ -289,68 +317,6 @@ class DefaultPooledConnectionProviderTest extends BaseHttpTest {
 		            .verify(Duration.ofSeconds(30));
 	}
 
-	@Test
-	void testConnectionReturnedToParentPoolWhenNoActiveStreams() throws Exception {
-		Http2SslContextSpec serverCtx = Http2SslContextSpec.forServer(ssc.certificate(), ssc.privateKey());
-		Http2SslContextSpec clientCtx =
-				Http2SslContextSpec.forClient()
-				                   .configure(builder -> builder.trustManager(InsecureTrustManagerFactory.INSTANCE));
-
-		disposableServer =
-				createServer()
-				        .wiretap(false)
-				        .protocol(HttpProtocol.H2)
-				        .secure(spec -> spec.sslContext(serverCtx))
-				        .route(routes -> routes.post("/", (req, res) -> res.send(req.receive().retain())))
-				        .bindNow();
-
-		int requestsNum = 10;
-		CountDownLatch latch = new CountDownLatch(1);
-		DefaultPooledConnectionProvider provider =
-				(DefaultPooledConnectionProvider) ConnectionProvider.create("testConnectionReturnedToParentPoolWhenNoActiveStreams", 5);
-		AtomicInteger counter = new AtomicInteger();
-		HttpClient client =
-				createClient(provider, disposableServer.port())
-						.wiretap(false)
-				        .protocol(HttpProtocol.H2)
-				        .secure(spec -> spec.sslContext(clientCtx))
-				        .observe((conn, state) -> {
-				            if (state == ConnectionObserver.State.CONNECTED) {
-				                counter.incrementAndGet();
-				            }
-				            if (state == ConnectionObserver.State.RELEASED && counter.decrementAndGet() == 0) {
-				                latch.countDown();
-				            }
-				        });
-
-		try {
-			Flux.range(0, requestsNum)
-			    .flatMap(i ->
-			        client.post()
-			              .uri("/")
-			              .send(ByteBufMono.fromString(Mono.just("testConnectionReturnedToParentPoolWhenNoActiveStreams")))
-			              .responseContent()
-			              .aggregate()
-			              .asString())
-			    .blockLast(Duration.ofSeconds(5));
-
-			assertThat(latch.await(5, TimeUnit.SECONDS)).isTrue();
-
-			assertThat(provider.channelPools).hasSize(1);
-
-			@SuppressWarnings({"unchecked", "rawtypes"})
-			InstrumentedPool<DefaultPooledConnectionProvider.PooledConnection> channelPool =
-					provider.channelPools.values().toArray(new InstrumentedPool[0])[0];
-			InstrumentedPool.PoolMetrics metrics = channelPool.metrics();
-			assertThat(metrics.acquiredSize()).isEqualTo(0);
-			assertThat(metrics.allocatedSize()).isEqualTo(metrics.idleSize());
-		}
-		finally {
-			provider.disposeLater()
-			        .block(Duration.ofSeconds(5));
-		}
-	}
-
 	@ParameterizedTest(name = "{displayName}({argumentsWithNames})")
 	@ValueSource(booleans = {false, true})
 	void testPoolGracefulShutdown(boolean enableGracefulShutdown) {
@@ -442,21 +408,33 @@ class DefaultPooledConnectionProviderTest extends BaseHttpTest {
 				      .bindNow();
 
 		DefaultPooledConnectionProvider provider =
-				(DefaultPooledConnectionProvider) ConnectionProvider.create("", 5);
+				(DefaultPooledConnectionProvider) ConnectionProvider.create("doTestIssue1982", 5);
 		CountDownLatch latch = new CountDownLatch(1);
 		AtomicInteger counter = new AtomicInteger();
+		AtomicReference<SocketAddress> serverAddress = new AtomicReference<>();
 		HttpClient mainClient = clientCtx != null ?
 				HttpClient.create(provider).port(disposableServer.port()).secure(sslContextSpec -> sslContextSpec.sslContext(clientCtx)) :
 				HttpClient.create(provider).port(disposableServer.port());
 
 		HttpClient client =
 				mainClient.protocol(clientProtocols)
+				          .metrics(true, Function.identity())
+				          .doAfterRequest((req, conn) -> serverAddress.set(conn.channel().remoteAddress()))
 				          .observe((conn, state) -> {
-				              if (state == ConnectionObserver.State.CONNECTED) {
+				              if (state == STREAM_CONFIGURED) {
 				                  counter.incrementAndGet();
-				              }
-				              if (state == ConnectionObserver.State.RELEASED && counter.decrementAndGet() == 0) {
-				                  latch.countDown();
+				                  conn.onTerminate()
+				                      .subscribe(null,
+				                              t -> conn.channel().eventLoop().execute(() -> {
+				                                  if (counter.decrementAndGet() == 0) {
+				                                      latch.countDown();
+				                                  }
+				                              }),
+				                              () -> conn.channel().eventLoop().execute(() -> {
+				                                  if (counter.decrementAndGet() == 0) {
+				                                      latch.countDown();
+				                                  }
+				                              }));
 				              }
 				          });
 		try {
@@ -471,12 +449,16 @@ class DefaultPooledConnectionProviderTest extends BaseHttpTest {
 
 			assertThat(latch.await(5, TimeUnit.SECONDS)).isTrue();
 
-			@SuppressWarnings({"unchecked", "rawtypes"})
-			InstrumentedPool<DefaultPooledConnectionProvider.PooledConnection> channelPool =
-					provider.channelPools.values().toArray(new InstrumentedPool[0])[0];
-			InstrumentedPool.PoolMetrics metrics = channelPool.metrics();
-			assertThat(metrics.acquiredSize()).isEqualTo(0);
-			assertThat(metrics.allocatedSize()).isEqualTo(metrics.idleSize());
+			InetSocketAddress sa = (InetSocketAddress) serverAddress.get();
+			String address = sa.getHostString() + ":" + sa.getPort();
+
+			assertThat(getGaugeValue(CONNECTION_PROVIDER_PREFIX + ACTIVE_CONNECTIONS,
+					REMOTE_ADDRESS, address, NAME, "http2.doTestIssue1982")).isEqualTo(0);
+			double idleConn = getGaugeValue(CONNECTION_PROVIDER_PREFIX + IDLE_CONNECTIONS,
+					REMOTE_ADDRESS, address, NAME, "http2.doTestIssue1982");
+			double totalConn = getGaugeValue(CONNECTION_PROVIDER_PREFIX + TOTAL_CONNECTIONS,
+					REMOTE_ADDRESS, address, NAME, "doTestIssue1982");
+			assertThat(totalConn).isEqualTo(idleConn);
 		}
 		finally {
 			provider.disposeLater()
@@ -511,5 +493,14 @@ class DefaultPooledConnectionProviderTest extends BaseHttpTest {
 			}
 			return r;
 		}
+	}
+
+	private double getGaugeValue(String gaugeName, String... tags) {
+		Gauge gauge = registry.find(gaugeName).tags(tags).gauge();
+		double result = -1;
+		if (gauge != null) {
+			result = gauge.value();
+		}
+		return result;
 	}
 }

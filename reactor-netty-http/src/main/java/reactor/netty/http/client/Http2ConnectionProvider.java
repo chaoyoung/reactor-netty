@@ -76,6 +76,9 @@ final class Http2ConnectionProvider extends PooledConnectionProvider<Connection>
 	Http2ConnectionProvider(ConnectionProvider parent) {
 		super(initConfiguration(parent));
 		this.parent = parent;
+		if (parent instanceof PooledConnectionProvider) {
+			((PooledConnectionProvider<?>) parent).onDispose(disposeLater());
+		}
 	}
 
 	static Builder initConfiguration(ConnectionProvider parent) {
