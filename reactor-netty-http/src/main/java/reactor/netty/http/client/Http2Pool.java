@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.Function;
 
+import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http2.Http2FrameCodec;
 import io.netty.handler.codec.http2.Http2MultiplexHandler;
 import org.reactivestreams.Publisher;
@@ -284,7 +285,7 @@ final class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.
 		try {
 			if (ref.slot.decrementConcurrencyAndGet() == 0) {
 				Connection connection = ref.poolable();
-				Http2FrameCodec frameCodec = connection.channel().pipeline().get(Http2FrameCodec.class);
+				ChannelHandlerContext frameCodec = ref.slot.http2FrameCodecCtx();
 				// By default, check the connection for removal on acquire and invalidate (only if there are no active streams)
 				// Not active or not HTTP/2 request
 				if (!connection.channel().isActive() || frameCodec == null) {
@@ -786,6 +787,9 @@ final class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.
 		final long creationTimestamp;
 		final Http2Pool pool;
 
+		volatile ChannelHandlerContext http2FrameCodecCtx;
+		volatile ChannelHandlerContext http2MultiplexHandlerCtx;
+
 		Slot(Http2Pool pool, Connection connection) {
 			this.connection = connection;
 			this.creationTimestamp = pool.clock.millis();
@@ -793,10 +797,9 @@ final class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.
 		}
 
 		boolean canOpenStream() {
-			Http2FrameCodec frameCodec = connection.channel().pipeline().get(Http2FrameCodec.class);
-			Http2MultiplexHandler multiplexHandler = connection.channel().pipeline().get(Http2MultiplexHandler.class);
-			if (frameCodec != null && multiplexHandler != null) {
-				int maxActiveStreams = frameCodec.connection().local().maxActiveStreams();
+			ChannelHandlerContext frameCodec = http2FrameCodecCtx();
+			if (frameCodec != null && http2MultiplexHandlerCtx() != null) {
+				int maxActiveStreams = ((Http2FrameCodec) frameCodec.handler()).connection().local().maxActiveStreams();
 				int concurrency = this.concurrency;
 				return concurrency < maxActiveStreams;
 			}
@@ -818,6 +821,28 @@ final class Http2Pool implements InstrumentedPool<Connection>, InstrumentedPool.
 
 		int decrementConcurrencyAndGet() {
 			return CONCURRENCY.decrementAndGet(this);
+		}
+
+		@Nullable
+		ChannelHandlerContext http2FrameCodecCtx() {
+			ChannelHandlerContext ctx = http2FrameCodecCtx;
+			if (ctx != null && !ctx.isRemoved()) {
+				return ctx;
+			}
+			ctx = connection.channel().pipeline().context(Http2FrameCodec.class);
+			http2FrameCodecCtx = ctx;
+			return ctx;
+		}
+
+		@Nullable
+		ChannelHandlerContext http2MultiplexHandlerCtx() {
+			ChannelHandlerContext ctx = http2MultiplexHandlerCtx;
+			if (ctx != null && !ctx.isRemoved()) {
+				return ctx;
+			}
+			ctx = connection.channel().pipeline().context(Http2MultiplexHandler.class);
+			http2MultiplexHandlerCtx = ctx;
+			return ctx;
 		}
 
 		void incrementConcurrencyAndGet() {
