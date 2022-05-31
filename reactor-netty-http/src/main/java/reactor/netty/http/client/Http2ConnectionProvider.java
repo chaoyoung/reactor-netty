@@ -357,6 +357,10 @@ final class Http2ConnectionProvider extends PooledConnectionProvider<Connection>
 					}
 				}
 				else {
+					Http2ConnectionProvider.registerClose(ch, this);
+					HttpClientConfig.addStreamHandlers(ch, obs.then(new HttpClientConfig.StreamConnectionObserver(currentContext())),
+							opsFactory, acceptGzip, metricsRecorder, -1, uriTagValue);
+
 					ChannelOperations<?, ?> ops = ChannelOperations.get(ch);
 					if (ops != null) {
 						obs.onStateChange(ops, STREAM_CONFIGURED);
